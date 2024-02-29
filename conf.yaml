@@ -1,0 +1,4 @@
+MSG_TYPE: dingtalk # wechat|dingtalk
+WX_URL: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=0a198f68-dcc1"
+DING_TOKEN: 85d1d7fe40a78585efa1de64d7ec12xxx
+DING_SECRET: SEC19c01f14d584dea7251671f823f4a6bf1b7xx

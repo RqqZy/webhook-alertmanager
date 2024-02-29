@@ -1,1 +1,1 @@
-# webhook-alertmanager
+# wechat-alertmanager
