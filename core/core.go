@@ -2,35 +2,40 @@ package core
 
 import (
 	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/wanghuiyt/ding"
-	yaml "gopkg.in/yaml.v3"
-	"io/ioutil"
-	"log"
+	"io"
 	"net/http"
-	"strings"
+	"os"
+	"text/template"
 	"time"
+
+	yaml "gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	WeChatURL     string `yaml:"WX_URL"`
-	DingDingToken string `yaml:"DING_TOKEN"`
-	DingDingSign  string `yaml:"DING_SECRET"`
-	MsgType       string `yaml:"MSG_TYPE"`
+	WeChatURL    string `yaml:"WX_URL"`
+	DING_URL     string `yaml:"DING_URL"`
+	DingDingSign string `yaml:"DING_SECRET"`
+	MsgType      string `yaml:"MSG_TYPE"`
 }
 
 type AlertWebhook struct {
 	Alerts []Alert `json:"alerts"`
 }
-type Alert struct {
-	Status      string      `json:"status"`
-	Labels      Lables      `json:"labels"`
+
+type Alert struct { //报警结构体
+	Status      string      `json:"status"` //报警状态
+	Labels      Labels      `json:"labels"` //报警名称
 	Annotations Annotations `json:"annotations"`
 	StartsAt    string      `json:"startsAt"`
 	EndsAt      string      `json:"endsAt"`
 }
-type Lables struct {
+type Labels struct { //报警具体事项
 	Alertname string `json:"alertname"`
 	Instance  string `json:"instance"`
 	Job       string `json:"job"`
@@ -49,117 +54,138 @@ func BuildTime(alterTime string) string {
 	if err != nil {
 		return ""
 	}
-
-	// 创建上海时区对象
 	shanghaiLoc, _ := time.LoadLocation("Asia/Shanghai")
-
-	// 将UTC时间转换为上海时间
 	localTime := utc.In(shanghaiLoc)
-
-	// 格式化为所需格式
 	return localTime.Format("2006年01月02日 15:04:05")
 }
+
 func LoadConfig(filename string) (*Config, error) {
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("读取配置文件 %s失败: %v", filename, err)
+		return nil, fmt.Errorf("read file %s: %w", filename, err)
 	}
 
 	var config Config
-	err = yaml.Unmarshal(data, &config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %v", err)
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
 
 	return &config, nil
 }
-func HandleWebhook(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "POST" && r.URL.Path == "/webhook" {
-		// 直接读取并转发请求体内容
 
-		body, err := ioutil.ReadAll(r.Body)
+func sendWebhookRequest(config *Config, payload *bytes.Buffer) error {
+	var req *http.Request
+	var err error
+	var resp *http.Response
+
+	switch config.MsgType {
+	case "wechat":
+		req, err = http.NewRequestWithContext(context.Background(), "POST", config.WeChatURL, payload)
 		if err != nil {
-			log.Printf("Failed to read request body: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
+			return fmt.Errorf("create request: %w", err)
 		}
-		defer r.Body.Close()
+		req.Header.Set("Content-Type", "application/json")
+	case "dingtalk":
+		timestamp := time.Now().UnixNano() / 1e6
+		stringToSign := fmt.Sprintf("%d\n%s", timestamp, config.DingDingSign)
 
-		var alerts AlertWebhook
-		err = json.Unmarshal(body, &alerts)
+		h := hmac.New(sha256.New, []byte(config.DingDingSign))
+		h.Write([]byte(stringToSign))
+		sign := base64.StdEncoding.EncodeToString(h.Sum(nil))
+		dingUrl := fmt.Sprintf("%s&timestamp=%d&sign=%s", config.DING_URL, timestamp, sign)
+		req, err = http.NewRequestWithContext(context.Background(), "POST", dingUrl, payload)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintf(w, "Error unmarshalling JSON to struct: %v", err)
-			return
+			return fmt.Errorf("create request: %w", err)
 		}
-		var markdown strings.Builder
-
-		for _, alert := range alerts.Alerts {
-			if alert.Status == "firing" {
-				markdown.WriteString(fmt.Sprintf("\n### 业务告警 ###\n"))
-				markdown.WriteString(fmt.Sprintf("**告警时间**: %s\n", BuildTime(alert.StartsAt)))
-			} else if alert.Status == "resolved" {
-				markdown.WriteString(fmt.Sprintf("\n### 告警恢复 ###\n"))
-
-				markdown.WriteString(fmt.Sprintf("**恢复时间**: %s\n", BuildTime(alert.EndsAt)))
-			}
-
-			markdown.WriteString(fmt.Sprintf("**告警状态**: %s\n", alert.Status))
-			markdown.WriteString(fmt.Sprintf("**告警类型**: %s\n", alert.Labels.Alertname))
-			markdown.WriteString(fmt.Sprintf("**告警主题**: %s\n", alert.Annotations.Summary))
-			markdown.WriteString(fmt.Sprintf("**告警详情**: %s %s\n", alert.Annotations.Description, alert.Annotations.Message))
-			markdown.WriteString(fmt.Sprintf("**告警级别**: %s\n", alert.Labels.Severity))
-			markdown.WriteString(fmt.Sprintf("**故障主机**: %s %s\n", alert.Labels.Instance, alert.Labels.Pod))
-
-		}
-		WebhookConfig, err := LoadConfig("conf.yaml")
-		if err != nil {
-			panic(err)
-		}
-		ChatType(WebhookConfig.MsgType, WebhookConfig.WeChatURL, WebhookConfig.DingDingToken, WebhookConfig.DingDingSign, markdown, w)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	} else {
-		w.WriteHeader(http.StatusNotFound)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("timestamp", fmt.Sprintf("%d", timestamp))
+		req.Header.Set("sign", sign)
+	default:
+		return fmt.Errorf("unsupported message type: %s", config.MsgType)
 	}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	resp, err = client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
-func ChatType(urlType string, wxkUrl string, dingToken string, dingSecret string, msg strings.Builder, w http.ResponseWriter) {
-	if urlType == "" {
-		panic("urlType is nil")
-	}
-	var s = msg.String()
-	fmt.Println(s)
-	switch urlType {
-	case "wechat":
-		wxPayload := map[string]interface{}{
-			"msgtype": "markdown",
-			"markdown": map[string]string{
-				"content": msg.String(),
-			},
-		}
-		jsonPayload, _ := json.Marshal(wxPayload)
-		resp, err := http.Post(wxkUrl, "application/json", bytes.NewBuffer(jsonPayload))
-		if err != nil {
-			log.Printf("Error posting to WeChat webhook: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		defer resp.Body.Close()
-
-		bodyResponse, _ := ioutil.ReadAll(resp.Body)
-		log.Printf("WeChat webhook response: %s", bodyResponse)
-	case "dingtalk":
-		d := ding.Webhook{AccessToken: dingToken, Secret: dingSecret}
-		err := d.SendMessageText(msg.String())
-		if err != nil {
-			log.Printf("Error posting to DingTalk webhook: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-	default:
-		log.Printf("Unsupported message type: %s", urlType)
-		w.WriteHeader(http.StatusBadRequest)
+func HandleWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" || r.URL.Path != "/webhook" {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var alerts AlertWebhook
+	if err := json.Unmarshal(body, &alerts); err != nil {
+		http.Error(w, "Error unmarshalling JSON to struct", http.StatusBadRequest)
+		return
+	}
+	tmpl, err := template.New("alert").Funcs(template.FuncMap{
+		"BuildTime": BuildTime,
+	}).Parse(wechatAlertTemplate) //
+	if err != nil {
+		http.Error(w, "Template parsing error", http.StatusInternalServerError)
+		return
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, alerts); err != nil {
+		http.Error(w, "Template execution error", http.StatusInternalServerError)
+		return
+	}
+
+	msg := buf.String()
+	markdown := map[string]interface{}{
+		"msgtype": "markdown",
+		"markdown": map[string]string{
+			"title":   "monitoring",
+			"content": msg,
+			"text":    msg,
+		},
+	}
+
+	message, err := json.Marshal(markdown)
+	if err != nil {
+		http.Error(w, "JSON marshalling error", http.StatusInternalServerError)
+		return
+	}
+	payload := bytes.NewBuffer(message)
+
+	config, err := LoadConfig("conf.yaml")
+	if err != nil {
+		http.Error(w, "Configuration loading error", http.StatusInternalServerError)
+		return
+	}
+
+	if config.MsgType == "" {
+		http.Error(w, "MsgType is not configured", http.StatusBadRequest)
+		return
+	}
+
+	if err := sendWebhookRequest(config, payload); err != nil {
+		http.Error(w, "Webhook sending error", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+
 }
