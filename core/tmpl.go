@@ -34,7 +34,7 @@ const wechatAlertTemplate = `
 告警详情: {{ .Annotations.Description }} {{ .Annotations.Message }}
 告警级别: {{ .Labels.Severity }}
 故障主机: {{ .Labels.Instance }} {{ .Labels.Pod }}
-<@祝禹>
+<@祝y>
 {{- end }}
 
 `
